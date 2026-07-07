@@ -216,7 +216,7 @@
 
 <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-app.js";
-    import { getFirestore, collection, addDoc, setDoc, getDoc, getDocs, deleteDoc, doc, updateDoc, query, where, orderBy, onSnapshot, limit, startAfter, documentId } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-firestore.js";
+    import { getFirestore, collection, collectionGroup, addDoc, setDoc, getDoc, getDocs, deleteDoc, doc, updateDoc, query, where, orderBy, onSnapshot, limit, startAfter, documentId, writeBatch } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-firestore.js";
     import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-auth.js";
 
     /*
@@ -267,6 +267,7 @@
     let pageState = { filter: 'الكل', searchQuery: '', lastDoc: null, hasMore: true, loading: false };
     let galleryImages = {};
     let unsubscribeNoti = null;
+    let currentNotiDocs = [];
 
     const fetchWithRetry = async (url, options, retries = 3, delay = 1500) => {
         try {
@@ -319,29 +320,68 @@
 
     const listenToNotifications = (currentUserId) => {
         if (unsubscribeNoti) unsubscribeNoti();
-        const qNoti = query(collection(db, "notifications"), where("toUserId", "==", currentUserId));
+        // نجلب آخر 30 إشعاراً فقط مرتبة حسب الأحدث لتفادي نمو غير محدود في القراءات
+        const qNoti = query(
+            collection(db, "notifications"),
+            where("toUserId", "==", currentUserId),
+            orderBy("timestamp", "desc"),
+            limit(30)
+        );
         unsubscribeNoti = onSnapshot(qNoti, (snapshot) => {
             const badge = document.getElementById('noti-count');
             const list = document.getElementById('noti-list');
-            if(snapshot.empty) {
+
+            currentNotiDocs = snapshot.docs.map(d => ({ id: d.id, ref: d.ref, data: d.data() }));
+
+            if (snapshot.empty) {
                 badge.style.display = 'none';
                 list.innerHTML = `<div style="padding:15px; text-align:center; color:#666; font-size:12px;">لا توجد إشعارات بعد...</div>`;
                 return;
             }
-            badge.innerText = snapshot.size; 
-            badge.style.display = 'block'; 
+
+            const unreadCount = currentNotiDocs.filter(n => !n.data.read).length;
+            if (unreadCount > 0) {
+                badge.innerText = unreadCount;
+                badge.style.display = 'block';
+            } else {
+                badge.style.display = 'none';
+            }
+
             list.innerHTML = "";
-            snapshot.forEach(docSnap => {
-                const noti = docSnap.data();
+            currentNotiDocs.forEach(({ data: noti, id }) => {
                 let icon = "🔔";
                 let actionText = "";
                 if (noti.type === "like") { icon = "❤️"; actionText = "أعجب بصورتك."; }
                 else if (noti.type === "comment") { icon = "💬"; actionText = `علّق على صورتك: "${escapeHtml(noti.commentText)}"`; }
                 else if (noti.type === "reply") { icon = "↩️"; actionText = `رد على تعليقك: "${escapeHtml(noti.commentText)}"`; }
-                
-                list.innerHTML += `<div class="noti-item">${icon} <b>${escapeHtml(noti.fromUserName)}</b> ${actionText}</div>`;
+
+                const unreadStyle = noti.read ? "" : "background: rgba(0,173,181,0.08); font-weight: bold;";
+                list.innerHTML += `<div class="noti-item" id="noti-item-${id}" style="${unreadStyle}">${icon} <b>${escapeHtml(noti.fromUserName)}</b> ${actionText}</div>`;
             });
         });
+    };
+
+    // تُستدعى عند فتح قائمة الإشعارات: تُبقي الإشعارات القديمة في القائمة لكن تُعلّمها كمقروءة
+    // فيختفي عدّاد "الجديد" (badge) ولا تعود تُحتسب ضمن غير المقروء لاحقاً
+    const markNotificationsRead = async () => {
+        const unread = currentNotiDocs.filter(n => !n.data.read);
+        if (unread.length === 0) return;
+
+        // تحديث فوري في الواجهة قبل استجابة الخادم لإحساس أسرع بالاستجابة
+        const badge = document.getElementById('noti-count');
+        if (badge) badge.style.display = 'none';
+        unread.forEach(n => {
+            const el = document.getElementById(`noti-item-${n.id}`);
+            if (el) el.style.cssText = "";
+        });
+
+        try {
+            const batch = writeBatch(db);
+            unread.forEach(n => batch.update(n.ref, { read: true }));
+            await batch.commit();
+        } catch (error) {
+            console.error("فشل تحديث حالة الإشعارات كمقروءة:", error);
+        }
     };
 
     const loadProfileStats = async (userId) => {
@@ -376,7 +416,7 @@
 
             userInfoBox.innerHTML = `
                 <div style="display:flex; align-items:center; justify-content:center; gap:15px; flex-wrap:wrap;">
-                    <img src="${userAvatar || 'https://ui-avatars.com/api/?name=' + encodeURIComponent(dispName)}" style="width:65px; height:65px; border-radius:50%; border:2px solid var(--accent); object-fit:cover;">
+                    <img src="${escapeHtml(userAvatar || 'https://ui-avatars.com/api/?name=' + encodeURIComponent(dispName))}" style="width:65px; height:65px; border-radius:50%; border:2px solid var(--accent); object-fit:cover;">
                     <div style="text-align:right;">
                         <h3 style="margin:0 0 5px 0;">${escapeHtml(dispName)}</h3>
                         <div style="font-size:13px; color:var(--text); display:flex; gap:15px; flex-wrap:wrap;">
@@ -505,7 +545,7 @@
         if (imageIds.length > 0) {
             for (let i = 0; i < imageIds.length; i += 10) {
                 const batchIds = imageIds.slice(i, i + 10);
-                const cQ = query(collection(db, "comments"), where("imageId", "in", batchIds));
+                const cQ = query(collectionGroup(db, "comments"), where("imageId", "in", batchIds));
                 const cSnap = await getDocs(cQ);
                 cSnap.forEach(cs => allComments.push({ id: cs.id, ...cs.data() }));
             }
@@ -515,7 +555,7 @@
         if (commentIds.length > 0) {
             for (let i = 0; i < commentIds.length; i += 10) {
                 const batchIds = commentIds.slice(i, i + 10);
-                const rQ = query(collection(db, "replies"), where("commentId", "in", batchIds));
+                const rQ = query(collectionGroup(db, "replies"), where("commentId", "in", batchIds));
                 const rSnap = await getDocs(rQ);
                 rSnap.forEach(rs => allReplies.push({ id: rs.id, ...rs.data() }));
             }
@@ -550,7 +590,7 @@
                     repliesHtml += `
                         <div class="reply-item">
                             <div style="display:flex; align-items:center; gap:6px;">
-                                <img src="${replyAvatar}" class="avatar-img-small" alt="avatar">
+                                <img src="${escapeHtml(replyAvatar)}" class="avatar-img-small" alt="avatar">
                                 <span><b>${safeReplyUser}:</b> ${safeReplyText}</span>
                             </div>
                             <button class="report-btn" data-targetid="${r.id}" data-type="reply" style="background:none; border:none; cursor:pointer;" title="إبلاغ">🚩</button>
@@ -561,7 +601,7 @@
                     <div class="comment-item" id="comment-container-${c.id}">
                         <div class="comment-header">
                             <div class="comment-user-box">
-                                <img src="${commentAvatar}" class="avatar-img-small" alt="avatar">
+                                <img src="${escapeHtml(commentAvatar)}" class="avatar-img-small" alt="avatar">
                                 <span class="comment-user">${safeCommentUser}:</span>
                                 <span id="text-${c.id}">${safeCommentText}</span>
                             </div>
@@ -569,8 +609,8 @@
                                 <button class="report-btn" data-targetid="${c.id}" data-type="comment" style="background:none; border:none; cursor:pointer;" title="إبلاغ">🚩</button>
                                 ${isMyComment ? `
                                     <span class="comment-actions">
-                                        <button class="edit-comment-btn" data-commentid="${c.id}" data-text="${escapeHtml(c.text)}" title="تعديل">✏️</button>
-                                        <button class="delete-comment-btn" data-commentid="${c.id}" title="حذف">🗑️</button>
+                                        <button class="edit-comment-btn" data-commentid="${c.id}" data-imageid="${imgId}" data-text="${escapeHtml(c.text)}" title="تعديل">✏️</button>
+                                        <button class="delete-comment-btn" data-commentid="${c.id}" data-imageid="${imgId}" title="حذف">🗑️</button>
                                     </span>
                                 ` : ''}
                             </div>
@@ -598,13 +638,13 @@
             gallery.innerHTML += `
                 <div class="photo-card" id="card-${imgId}">
                     <div class="photo-header">
-                        <img src="${userAvatar}" class="avatar-img" alt="avatar">
+                        <img src="${escapeHtml(userAvatar)}" class="avatar-img" alt="avatar">
                         <h3 class="photo-title" style="margin:0;">${safeCategory} — بواسطة ${safeUserName}</h3>
                     </div>
-                    <span class="user-tag" data-userid="${item.userId}">👤 ملف المصمم</span>
-                    ${(myId && item.userId === myId) ? `<button class="del-btn" data-imgid="${imgId}">×</button>` : ''}
+                    <span class="user-tag" data-userid="${escapeHtml(item.userId)}">👤 ملف المصمم</span>
+                    ${(myId && item.userId === myId) ? `<button class="del-btn" data-imgid="${escapeHtml(imgId)}">×</button>` : ''}
                     
-                    <img class="photo-img" src="${item.src}" alt="${safeCategory} بواسطة ${safeUserName}" loading="lazy" data-imgid="${imgId}">
+                    <img class="photo-img" src="${escapeHtml(item.src)}" alt="${safeCategory} بواسطة ${safeUserName}" loading="lazy" data-imgid="${escapeHtml(imgId)}">
                     
                     <div class="tags-container">${tagsHtml}</div>
 
@@ -615,10 +655,10 @@
                         </button>
                         
                         <div class="share-actions">
-                            <button class="share-btn whatsapp" data-src="${item.src}" data-category="${safeCategory}" title="واتساب">💬</button>
-                            <button class="share-btn facebook" data-src="${item.src}" title="فيسبوك">👥</button>
-                            <button class="report-btn" data-targetid="${imgId}" data-type="image" style="background:none; border:none; cursor:pointer;" title="إبلاغ عن محتوى">🚩</button>
-                            <a href="${item.src}" download style="text-decoration:none; font-size:14px; color:var(--accent);">📥 تحميل</a>
+                            <button class="share-btn whatsapp" data-src="${escapeHtml(item.src)}" data-category="${safeCategory}" title="واتساب">💬</button>
+                            <button class="share-btn facebook" data-src="${escapeHtml(item.src)}" title="فيسبوك">👥</button>
+                            <button class="report-btn" data-targetid="${escapeHtml(imgId)}" data-type="image" style="background:none; border:none; cursor:pointer;" title="إبلاغ عن محتوى">🚩</button>
+                            <a href="${escapeHtml(item.src)}" download style="text-decoration:none; font-size:14px; color:var(--accent);">📥 تحميل</a>
                         </div>
                     </div>
                     
@@ -686,6 +726,7 @@
                     fromUserName: currentUserName,
                     type: "like",
                     imageId,
+                    read: false,
                     timestamp: Date.now()
                 });
             }
@@ -704,7 +745,8 @@
         input.value = ""; 
 
         try {
-            const docRef = await addDoc(collection(db, "comments"), { 
+            // التعليقات تُخزَّن الآن كمجموعة فرعية تحت الصورة: images/{imageId}/comments/{commentId}
+            const docRef = await addDoc(collection(db, "images", imageId, "comments"), { 
                 imageId, 
                 text, 
                 userId: currentUserId, 
@@ -721,15 +763,15 @@
                 <div class="comment-item" id="comment-container-${docRef.id}">
                     <div class="comment-header">
                         <div class="comment-user-box">
-                            <img src="${currentUserAvatar || 'https://ui-avatars.com/api/?name=' + encodeURIComponent(currentUserName)}" class="avatar-img-small" alt="avatar">
+                            <img src="${escapeHtml(currentUserAvatar || 'https://ui-avatars.com/api/?name=' + encodeURIComponent(currentUserName))}" class="avatar-img-small" alt="avatar">
                             <span class="comment-user">${escapeHtml(currentUserName)}:</span>
                             <span id="text-${docRef.id}">${escapeHtml(text)}</span>
                         </div>
                         <div style="display:flex; align-items:center; gap:5px;">
                             <button class="report-btn" data-targetid="${docRef.id}" data-type="comment" style="background:none; border:none; cursor:pointer;" title="إبلاغ">🚩</button>
                             <span class="comment-actions">
-                                <button class="edit-comment-btn" data-commentid="${docRef.id}" data-text="${escapeHtml(text)}" title="تعديل">✏️</button>
-                                <button class="delete-comment-btn" data-commentid="${docRef.id}" title="حذف">🗑️</button>
+                                <button class="edit-comment-btn" data-commentid="${docRef.id}" data-imageid="${imageId}" data-text="${escapeHtml(text)}" title="تعديل">✏️</button>
+                                <button class="delete-comment-btn" data-commentid="${docRef.id}" data-imageid="${imageId}" title="حذف">🗑️</button>
                             </span>
                         </div>
                     </div>
@@ -749,6 +791,7 @@
                     type: "comment", 
                     commentText: text, 
                     imageId, 
+                    read: false,
                     timestamp: Date.now() 
                 });
             }
@@ -767,7 +810,8 @@
         input.value = "";
 
         try {
-            const replyRef = await addDoc(collection(db, "replies"), {
+            // الردود تُخزَّن كمجموعة فرعية تحت التعليق: images/{imageId}/comments/{commentId}/replies/{replyId}
+            const replyRef = await addDoc(collection(db, "images", imageId, "comments", commentId, "replies"), {
                 commentId,
                 imageId,
                 text,
@@ -781,7 +825,7 @@
             const newReplyHtml = `
                 <div class="reply-item">
                     <div style="display:flex; align-items:center; gap:6px;">
-                        <img src="${currentUserAvatar || 'https://ui-avatars.com/api/?name=' + encodeURIComponent(currentUserName)}" class="avatar-img-small" alt="avatar">
+                        <img src="${escapeHtml(currentUserAvatar || 'https://ui-avatars.com/api/?name=' + encodeURIComponent(currentUserName))}" class="avatar-img-small" alt="avatar">
                         <span><b>${escapeHtml(currentUserName)}:</b> ${escapeHtml(text)}</span>
                     </div>
                     <button class="report-btn" data-targetid="${replyRef.id}" data-type="reply" style="background:none; border:none; cursor:pointer;" title="إبلاغ">🚩</button>
@@ -796,13 +840,14 @@
                     type: "reply",
                     commentText: text,
                     imageId,
+                    read: false,
                     timestamp: Date.now()
                 });
             }
         } catch (error) { console.error(error); }
     };
 
-    const editComment = async (event, commentId, oldText) => {
+    const editComment = async (event, commentId, imageId, oldText) => {
         if(event) event.preventDefault();
         const newText = prompt("تعديل التعليق:", oldText);
         if(!newText || newText.trim() === oldText) return;
@@ -810,15 +855,22 @@
         const textEl = document.getElementById('text-' + commentId);
         if(textEl) textEl.innerText = newText.trim();
 
-        try { await updateDoc(doc(db, "comments", commentId), { text: newText.trim() }); } catch (error) { alert("فشل تعديل التعليق"); }
+        try { await updateDoc(doc(db, "images", imageId, "comments", commentId), { text: newText.trim() }); } catch (error) { alert("فشل تعديل التعليق"); }
     };
 
-    const deleteComment = async (event, commentId) => {
+    const deleteComment = async (event, commentId, imageId) => {
         if(event) event.preventDefault();
         if(confirm("هل تريد حذف هذا التعليق؟")) {
             const commentBox = document.getElementById(`comment-container-${commentId}`);
             if(commentBox) commentBox.remove();
-            try { await deleteDoc(doc(db, "comments", commentId)); } catch (error) { alert("فشل حذف التعليق"); }
+            try {
+                // حذف الردود المرتبطة بالتعليق أولاً (مجموعة فرعية) ثم حذف التعليق نفسه
+                const repliesSnap = await getDocs(collection(db, "images", imageId, "comments", commentId, "replies"));
+                for (const r of repliesSnap.docs) {
+                    await deleteDoc(r.ref);
+                }
+                await deleteDoc(doc(db, "images", imageId, "comments", commentId));
+            } catch (error) { alert("فشل حذف التعليق"); }
         }
     };
 
@@ -827,20 +879,54 @@
         if(confirm("هل تريد حذف هذه الصورة نهائياً؟")) { 
             const card = document.getElementById(`card-${id}`);
             if(card) card.remove();
-            try { await deleteDoc(doc(db, "images", id)); } catch (error) { alert("فشل حذف الصورة"); }
+            try {
+                // حذف كل التعليقات والردود المرتبطة بالصورة (مجموعات فرعية) قبل حذف الصورة نفسها
+                const commentsSnap = await getDocs(collection(db, "images", id, "comments"));
+                for (const c of commentsSnap.docs) {
+                    const repliesSnap = await getDocs(collection(db, "images", id, "comments", c.id, "replies"));
+                    for (const r of repliesSnap.docs) {
+                        await deleteDoc(r.ref);
+                    }
+                    await deleteDoc(c.ref);
+                }
+                await deleteDoc(doc(db, "images", id));
+            } catch (error) { alert("فشل حذف الصورة"); }
         }
     };
 
     const reportContent = async (imageId, reason = "غير لائق") => {
+        // يجب تسجيل الدخول لتقديم بلاغ عن صورة
+        if (!auth.currentUser) {
+            alert("يجب تسجيل الدخول لتقديم بلاغ.");
+            return;
+        }
+        const reporterId = auth.currentUser.uid;
         try {
+            // منع نفس المستخدم من إرسال أكثر من بلاغ واحد على نفس الصورة
+            const existingQ = query(
+                collection(db, "reports"),
+                where("reportedImageId", "==", imageId),
+                where("reporterId", "==", reporterId)
+            );
+            const existingSnap = await getDocs(existingQ);
+            if (!existingSnap.empty) {
+                alert("لقد قمت بالإبلاغ عن هذه الصورة من قبل.");
+                return;
+            }
+
             await addDoc(collection(db, "reports"), {
                 reportedImageId: imageId,
+                targetId: imageId,
+                targetType: "image",
                 reason: reason,
+                reporterId: reporterId,
+                reporterName: auth.currentUser.displayName || "عضو",
                 timestamp: Date.now()
             });
             alert("تم إرسال بلاغك للمراجعة، شكراً لمساهمتك.");
         } catch (e) {
             console.error("خطأ في إرسال البلاغ:", e);
+            alert("حدث خطأ أثناء إرسال الإبلاغ.");
         }
     };
 
@@ -849,12 +935,25 @@
         const reason = prompt("يرجى توضيح سبب الإبلاغ عن هذا المحتوى:");
         if (!reason || !reason.trim()) return;
 
+        const reporterId = auth.currentUser.uid;
         try {
+            // منع تكرار البلاغ من نفس المستخدم على نفس العنصر
+            const existingQ = query(
+                collection(db, "reports"),
+                where("targetId", "==", targetId),
+                where("reporterId", "==", reporterId)
+            );
+            const existingSnap = await getDocs(existingQ);
+            if (!existingSnap.empty) {
+                alert("لقد قمت بالإبلاغ عن هذا المحتوى من قبل.");
+                return;
+            }
+
             await addDoc(collection(db, "reports"), {
                 targetId,
                 targetType: type,
                 reason: reason.trim(),
-                reporterId: auth.currentUser.uid,
+                reporterId,
                 reporterName: auth.currentUser.displayName || "عضو",
                 timestamp: Date.now()
             });
@@ -870,7 +969,8 @@
             return;
         }
         try {
-            const reportsSnap = await getDocs(collection(db, "reports"));
+            // ملاحظة أداء: يتم تحديد حد أقصى للقراءة لتفادي قراءة غير محدودة لمجموعة البلاغات
+            const reportsSnap = await getDocs(query(collection(db, "reports"), limit(1000)));
             const imageReportsCount = {};
             
             reportsSnap.forEach(docSnap => {
@@ -884,6 +984,15 @@
             let deletedCount = 0;
             for (const [imgId, count] of Object.entries(imageReportsCount)) {
                 if (count >= 5) {
+                    // حذف التعليقات والردود المرتبطة (مجموعات فرعية) قبل حذف الصورة
+                    const commentsSnap = await getDocs(collection(db, "images", imgId, "comments"));
+                    for (const c of commentsSnap.docs) {
+                        const repliesSnap = await getDocs(collection(db, "images", imgId, "comments", c.id, "replies"));
+                        for (const r of repliesSnap.docs) {
+                            await deleteDoc(r.ref);
+                        }
+                        await deleteDoc(c.ref);
+                    }
                     await deleteDoc(doc(db, "images", imgId));
                     
                     const assocReports = reportsSnap.docs.filter(d => d.data().reportedImageId === imgId);
@@ -965,13 +1074,13 @@
 
         const editBtn = target.closest('.edit-comment-btn');
         if (editBtn) {
-            editComment(e, editBtn.dataset.commentid, editBtn.dataset.text);
+            editComment(e, editBtn.dataset.commentid, editBtn.dataset.imageid, editBtn.dataset.text);
             return;
         }
 
         const deleteBtn = target.closest('.delete-comment-btn');
         if (deleteBtn) {
-            deleteComment(e, deleteBtn.dataset.commentid);
+            deleteComment(e, deleteBtn.dataset.commentid, deleteBtn.dataset.imageid);
             return;
         }
 
@@ -1002,14 +1111,14 @@
         const shareWA = target.closest('.share-btn.whatsapp');
         if (shareWA) {
             const url = `https://api.whatsapp.com/send?text=${encodeURIComponent(shareWA.dataset.category + ": " + shareWA.dataset.src)}`;
-            window.open(url, '_blank');
+            window.open(url, '_blank', 'noopener,noreferrer');
             return;
         }
 
         const shareFB = target.closest('.share-btn.facebook');
         if (shareFB) {
             const url = `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(shareFB.dataset.src)}`;
-            window.open(url, '_blank');
+            window.open(url, '_blank', 'noopener,noreferrer');
             return;
         }
     });
@@ -1059,7 +1168,9 @@
     document.getElementById('noti-wrapper-area').addEventListener('click', (e) => {
         e.stopPropagation();
         const d = document.getElementById('noti-dropdown');
-        d.style.display = d.style.display === 'block' ? 'none' : 'block';
+        const willOpen = d.style.display !== 'block';
+        d.style.display = willOpen ? 'block' : 'none';
+        if (willOpen) markNotificationsRead();
     });
 
     window.addEventListener('click', () => {
