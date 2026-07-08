@@ -1306,69 +1306,57 @@
         uploadInput.disabled = true;
 
         try {
-            const compressed = await compressImage(file);
+            // ضغط الصورة
+            const { blob } = await compressImage(file);
+
             statusText.innerText = "جاري رفع الصورة...";
-            const ext = compressed.mimeType === 'image/webp' ? 'webp' : 'jpg';
-            const formData = new FormData(); 
-            formData.append("image", compressed.blob, `image.${ext}`);
 
-            let imageUrl = "";
-            
-            try {
-                const userToken = await auth.currentUser.getIdToken();
-                const backendResponse = await fetchWithRetry("/api/upload", { 
-                    method: "POST", 
-                    body: formData,
-                    headers: { "Authorization": `Bearer ${userToken}` }
-                });
-                if (backendResponse.ok) {
-                    const data = await backendResponse.json();
-                    imageUrl = data.url;
-                }
-            } catch (err) {
-                console.warn("استخدام الرفع الاحتياطي المباشر...");
+            // تحويل إلى Base64
+            const base64 = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(reader.result.split(",")[1]);
+                reader.onerror = reject;
+                reader.readAsDataURL(blob);
+            });
+
+            const formData = new FormData();
+            formData.append("image", base64);
+
+            // الرفع إلى ImgBB مباشرة (مع إعادة محاولة تلقائية عند انقطاع الشبكة)
+            const response = await fetchWithRetry(`https://api.imgbb.com/1/upload?key=${IMGBB_API_KEY}`, {
+                method: "POST",
+                body: formData
+            });
+            const result = await response.json();
+
+            if (!result.success) {
+                throw new Error("فشل رفع الصورة إلى ImgBB");
             }
 
-            if (!imageUrl) {
-                try {
-                    const response = await fetchWithRetry(`https://api.imgbb.com/1/upload?key=${IMGBB_API_KEY}`, { 
-                        method: "POST", 
-                        body: formData 
-                    });
-                    const result = await response.json();
-                    if (result.success) {
-                        imageUrl = result.data.url;
-                    }
-                } catch (imgbbErr) {
-                    console.error("فشل الرفع الاحتياطي المباشر للشبكة:", imgbbErr);
-                }
-            }
+            const imageUrl = result.data.url;
 
-            if (imageUrl) {
-                const tagInputValue = document.getElementById('tagInput').value.trim();
-                const parsedTags = tagInputValue ? tagInputValue.split(/[،,]+/).map(t => t.trim()).filter(Boolean) : [];
-                
-                await addDoc(collection(db, "images"), { 
-                    src: imageUrl, 
-                    cat: document.getElementById('catSelect').value, 
-                    userId: auth.currentUser.uid, 
-                    userName: auth.currentUser.displayName,
-                    userAvatar: auth.currentUser.photoURL || "",
-                    likes: [],
-                    likesCount: 0,
-                    tags: parsedTags,
-                    timestamp: Date.now()
-                });
-                statusText.innerText = "تم الرفع بنجاح! 🎉";
-                document.getElementById('tagInput').value = "";
-                setTimeout(() => statusText.innerText = "", 3000);
-                render();
-            } else {
-                statusText.innerText = "تعذر رفع الصورة بعد عدة محاولات.";
-            }
+            const tagInputValue = document.getElementById('tagInput').value.trim();
+            const parsedTags = tagInputValue ? tagInputValue.split(/[،,]+/).map(t => t.trim()).filter(Boolean) : [];
+
+            await addDoc(collection(db, "images"), { 
+                src: imageUrl, 
+                cat: document.getElementById('catSelect').value, 
+                userId: auth.currentUser.uid, 
+                userName: auth.currentUser.displayName,
+                userAvatar: auth.currentUser.photoURL || "",
+                likes: [],
+                likesCount: 0,
+                tags: parsedTags,
+                timestamp: Date.now()
+            });
+
+            statusText.innerText = "✅ تم رفع الصورة بنجاح";
+            document.getElementById('tagInput').value = "";
+            setTimeout(() => statusText.innerText = "", 3000);
+            render();
         } catch (error) {
             console.error(error);
-            statusText.innerText = "حدث خطأ غير متوقع أثناء الرفع.";
+            statusText.innerText = "❌ فشل رفع الصورة";
         } finally {
             spinner.style.display = "none";
             uploadInput.disabled = false;
